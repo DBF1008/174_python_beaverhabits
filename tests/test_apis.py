@@ -711,3 +711,57 @@ def test_complete_nonexistent_habit(auth_headers, client: TestClient):
         headers=auth_headers,
     )
     assert response.status_code == 404
+
+
+# ============================================================================
+# Habit Order Metadata Tests
+# ============================================================================
+
+
+def test_habits_meta_order_is_sanitized(auth_headers, client: TestClient):
+    """PUT /habits/meta with a ghost id and a duplicate returns a clean order."""
+    a = client.post(
+        "/api/v1/habits", json={"name": "Meta A"}, headers=auth_headers
+    ).json()
+    b = client.post(
+        "/api/v1/habits", json={"name": "Meta B"}, headers=auth_headers
+    ).json()
+    id_a, id_b = a["id"], b["id"]
+
+    resp = client.put(
+        "/api/v1/habits/meta",
+        json={"order": [id_b, "ghost-id", id_a, id_b]},
+        headers=auth_headers,
+    )
+    assert resp.status_code == 200
+    # Unknown id dropped, duplicate removed.
+    assert resp.json()["order"] == [id_b, id_a]
+
+    # GET reflects the same sanitized order.
+    get_resp = client.get("/api/v1/habits/meta", headers=auth_headers)
+    assert get_resp.status_code == 200
+    assert get_resp.json()["order"] == [id_b, id_a]
+
+
+def test_habits_meta_drops_deleted_habit(auth_headers, client: TestClient):
+    """A deleted habit no longer appears in the order returned by /habits/meta."""
+    ids = []
+    for name in ("Del A", "Del B", "Del C"):
+        resp = client.post(
+            "/api/v1/habits", json={"name": name}, headers=auth_headers
+        )
+        ids.append(resp.json()["id"])
+    id_a, id_b, id_c = ids
+
+    client.put(
+        "/api/v1/habits/meta",
+        json={"order": [id_c, id_b, id_a]},
+        headers=auth_headers,
+    )
+
+    del_resp = client.delete(f"/api/v1/habits/{id_b}", headers=auth_headers)
+    assert del_resp.status_code == 200
+
+    order = client.get("/api/v1/habits/meta", headers=auth_headers).json()["order"]
+    assert id_b not in order
+    assert order == [id_c, id_a]

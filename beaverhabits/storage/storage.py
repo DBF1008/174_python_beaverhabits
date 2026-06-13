@@ -195,6 +195,8 @@ class HabitList[H: Habit](Protocol):
     @order.setter
     def order(self, value: List[str]) -> None: ...
 
+    def reconcile_order(self) -> List[str]: ...
+
     @property
     def order_by(self) -> HabitOrder: ...
 
@@ -226,6 +228,51 @@ class UserStorage[L: HabitList](Protocol):
     async def init_user_habit_list(self, user: User, habit_list: L) -> None: ...
 
 
+def reconcile_habit_order(habits: List[Habit], order: List[str]) -> List[str]:
+    """Return the canonical manual-order list of habit ids.
+
+    This is the single source of truth for manual ordering. Whichever way the
+    habit list was mutated (drag, API, delete, archive, import), feeding the
+    current habits and the stored order through here yields a list with these
+    invariants:
+
+    * every existing habit id appears exactly once -- stale ids and duplicates
+      are dropped, so deleted/archived habits never leave a phantom position;
+    * ids already present in ``order`` keep their relative order;
+    * habits missing from ``order`` (newly added or imported) are appended in
+      ``habits`` iteration order, so the result is deterministic instead of
+      collapsing to ``float("inf")`` at render time;
+    * ACTIVE habits are grouped before non-active ones (archived / soft-deleted),
+      giving a well-defined archive boundary that matches the reorder page.
+
+    Non-string entries coming from corrupted data simply fail to match a habit
+    id and are discarded.
+    """
+    existing = {str(habit.id): habit for habit in habits}
+
+    ranked: list[str] = []
+    seen: set[str] = set()
+
+    # Keep known ids from the stored order (deduplicated, stale ids skipped).
+    for habit_id in order:
+        key = str(habit_id)
+        if key in existing and key not in seen:
+            ranked.append(key)
+            seen.add(key)
+
+    # Append habits that were missing from the stored order.
+    for habit in habits:
+        key = str(habit.id)
+        if key not in seen:
+            ranked.append(key)
+            seen.add(key)
+
+    # Stable-group active habits before the rest (archived / soft-deleted).
+    active = [key for key in ranked if existing[key].status == HabitStatus.ACTIVE]
+    rest = [key for key in ranked if existing[key].status != HabitStatus.ACTIVE]
+    return active + rest
+
+
 class HabitListBuilder:
     def __init__(self, habit_list: HabitList):
         self.habit_list = habit_list
@@ -248,10 +295,12 @@ class HabitListBuilder:
             habits.sort(key=lambda x: x.name.lower())
         elif self.habit_list.order_by == HabitOrder.CATEGORY:
             habits.sort(key=lambda x: (0, x.tags[0].lower()) if x.tags else (1, ""))
-        elif o := self.habit_list.order:
-            habits.sort(
-                key=lambda x: (o.index(str(x.id)) if str(x.id) in o else float("inf"))
+        elif self.habit_list.order_by == HabitOrder.MANUALLY:
+            order = reconcile_habit_order(
+                self.habit_list.habits, self.habit_list.order
             )
+            rank = {habit_id: index for index, habit_id in enumerate(order)}
+            habits.sort(key=lambda x: rank.get(str(x.id), len(rank)))
 
         # sort by star
         habits.sort(key=lambda x: x.star, reverse=True)

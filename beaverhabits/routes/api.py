@@ -35,7 +35,7 @@ class HabitListMeta(BaseModel):
 async def get_habits_meta(
     habit_list: HabitList = Depends(current_habit_list),
 ):
-    return HabitListMeta(order=habit_list.order)
+    return HabitListMeta(order=habit_list.reconcile_order())
 
 
 @api_router.put("/habits/meta", tags=["habits"])
@@ -45,7 +45,8 @@ async def put_habits_meta(
 ):
     if meta.order is not None:
         habit_list.order = meta.order
-    return {"order": habit_list.order}
+    # Sanitize the (possibly partial/duplicated/unknown) client order before persisting
+    return {"order": habit_list.reconcile_order()}
 
 
 @api_router.get("/habits", tags=["habits"])

@@ -48,6 +48,8 @@ async def item_drop(e, habit_list: HabitList):
     # Update order
     habit_list.order = [str(x.id) for x in habits]
     habit_list.order_by = HabitOrder.MANUALLY
+    # Re-sync: drop stale ids and re-append soft-deleted habits omitted by the DOM
+    habit_list.reconcile_order()
     logger.info(f"New order: {habits}")
 
     add_ui.refresh()

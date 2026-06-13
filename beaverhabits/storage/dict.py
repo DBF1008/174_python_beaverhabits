@@ -10,6 +10,7 @@ from beaverhabits.storage.storage import (
     HabitList,
     HabitOrder,
     HabitStatus,
+    reconcile_habit_order,
 )
 from beaverhabits.utils import generate_short_hash
 
@@ -261,6 +262,18 @@ class DictHabitList(HabitList[DictHabit], DictStorage):
     def order(self, value: list[str]) -> None:
         self.data["order"] = value
 
+    def reconcile_order(self) -> list[str]:
+        """Clean up and persist the manual order against the current habits.
+
+        Drops stale/duplicate ids, appends habits missing from the order, and
+        groups active habits before archived/soft-deleted ones. Only writes when
+        the result actually changes to avoid spurious persistence backups.
+        """
+        order = reconcile_habit_order(self.habits, self.order)
+        if order != self.data.get("order"):
+            self.data["order"] = order
+        return order
+
     @property
     def order_by(self) -> HabitOrder:
         order_value = self.data.get("order_by")
@@ -304,10 +317,12 @@ class DictHabitList(HabitList[DictHabit], DictStorage):
         id = generate_short_hash(name)
         d = {"name": name, "records": [], "id": id, "tags": tags or []}
         self.data["habits"].append(d)
+        self.reconcile_order()
         return id
 
     async def remove(self, item: DictHabit) -> None:
         self.data["habits"].remove(item.data)
+        self.reconcile_order()
 
     async def merge(self, other: "DictHabitList") -> None:
         # Add new habits
@@ -322,3 +337,6 @@ class DictHabitList(HabitList[DictHabit], DictStorage):
             for other_habit in other.habits:
                 if self_habit == other_habit:
                     await self_habit.merge(other_habit)
+
+        # Keep the manual order in sync with the imported/merged habits
+        self.reconcile_order()
