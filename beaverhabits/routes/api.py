@@ -17,6 +17,9 @@ from beaverhabits.storage.storage import (
     HabitStatus,
 )
 
+JOURNAL_DONE = "DONE"
+JOURNAL_PERIOD_DONE = "PERIOD_DONE"
+
 api_router = APIRouter()
 
 
@@ -29,6 +32,20 @@ async def current_habit_list(user: User = Depends(current_active_user)) -> Habit
 
 class HabitListMeta(BaseModel):
     order: list[str] | None = None
+
+
+class CompletionJournalEntry(BaseModel):
+    date: str
+    done: bool
+    text: str
+    completion_type: Literal["DONE", "PERIOD_DONE"]
+
+
+class CompletionJournalResponse(BaseModel):
+    total: int
+    offset: int
+    limit: int | None
+    entries: list[CompletionJournalEntry]
 
 
 @api_router.get("/habits/meta", tags=["habits"])
@@ -187,6 +204,108 @@ async def get_habit_completions(
         ticked_days = ticked_days[:limit]
 
     return [x.strftime(date_fmt) for x in ticked_days]
+
+
+def _build_journal_entries(
+    habit: Habit,
+    status_map: dict[datetime.date, list[CStatus]],
+    start: datetime.date,
+    end: datetime.date,
+    date_fmt: str,
+) -> list[CompletionJournalEntry]:
+    """Build structured journal entries from the completion status map."""
+    entries: list[CompletionJournalEntry] = []
+
+    for day, statuses in status_map.items():
+        if start > day or day > end:
+            continue
+
+        has_done = CStatus.DONE in statuses
+        has_period = CStatus.PERIOD_DONE in statuses
+
+        if has_done:
+            # Prefer explicit tick; attach note from the record
+            record = habit.record_by(day)
+            text = record.text if record else ""
+            entries.append(
+                CompletionJournalEntry(
+                    date=day.strftime(date_fmt),
+                    done=True,
+                    text=text,
+                    completion_type=JOURNAL_DONE,
+                )
+            )
+        elif has_period:
+            # Period target met on a day the user did not explicitly tick
+            entries.append(
+                CompletionJournalEntry(
+                    date=day.strftime(date_fmt),
+                    done=True,
+                    text="",
+                    completion_type=JOURNAL_PERIOD_DONE,
+                )
+            )
+
+    return entries
+
+
+@api_router.get("/habits/{habit_id}/journal", tags=["habits"])
+async def get_habit_journal(
+    habit_id: str,
+    date_fmt: str = "%d-%m-%Y",
+    date_start: str | None = None,
+    date_end: str | None = None,
+    sort: str = "asc",
+    offset: int = 0,
+    limit: int | None = None,
+    user: User = Depends(current_active_user),
+):
+    # Parse date range
+    start, end = datetime.date.min, datetime.date.max
+    if date_start:
+        try:
+            start = datetime.datetime.strptime(date_start, date_fmt.strip()).date()
+        except ValueError:
+            raise HTTPException(status_code=400, detail="Invalid date format")
+    if date_end:
+        try:
+            end = datetime.datetime.strptime(date_end, date_fmt.strip()).date()
+        except ValueError:
+            raise HTTPException(status_code=400, detail="Invalid date format")
+    if start > end:
+        raise HTTPException(
+            status_code=400, detail="date_start cannot be after date_end"
+        )
+
+    if sort not in ("asc", "desc"):
+        raise HTTPException(status_code=400, detail="Invalid sort value")
+
+    if offset < 0:
+        raise HTTPException(status_code=400, detail="offset must be >= 0")
+
+    habit = await views.get_user_habit(user, habit_id)
+    status_map = get_habit_date_completion(habit, start, end)
+    entries = _build_journal_entries(habit, status_map, start, end, date_fmt)
+
+    # Sort
+    entries.sort(
+        key=lambda e: datetime.datetime.strptime(e.date, date_fmt.strip()).date(),
+        reverse=(sort == "desc"),
+    )
+
+    total = len(entries)
+
+    # Pagination
+    entries = entries[offset:]
+    if limit is not None:
+        entries = entries[:limit]
+
+    return CompletionJournalResponse(
+        total=total,
+        offset=offset,
+        limit=limit,
+        entries=entries,
+    )
 
 
 class Tick(BaseModel):
