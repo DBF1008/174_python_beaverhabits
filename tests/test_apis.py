@@ -3,7 +3,7 @@ Test suite for Beaver Habits API based on the official API documentation.
 Tests cover: authentication, habit CRUD operations, and habit completions.
 """
 
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
 
 import pytest
 from fastapi import Depends, FastAPI
@@ -711,3 +711,251 @@ def test_complete_nonexistent_habit(auth_headers, client: TestClient):
         headers=auth_headers,
     )
     assert response.status_code == 404
+
+
+# ============================================================================
+# Structured Statistics Tests (/habits/stats, /habits/{id}/stats)
+# ============================================================================
+
+FMT = "%d-%m-%Y"
+
+
+def _create_habit(client: TestClient, headers, name: str) -> str:
+    response = client.post("/api/v1/habits", json={"name": name}, headers=headers)
+    assert response.status_code == 200
+    return response.json()["id"]
+
+
+def _complete(client: TestClient, headers, habit_id: str, days) -> None:
+    for day in days:
+        response = client.post(
+            f"/api/v1/habits/{habit_id}/completions",
+            json={"date_fmt": FMT, "date": day.strftime(FMT), "done": True},
+            headers=headers,
+        )
+        assert response.status_code == 200
+
+
+def test_stats_normal_habit(auth_headers, client: TestClient):
+    """A plain (non-periodic) habit reports streak/heatmap/monthly figures."""
+    habit_id = _create_habit(client, auth_headers, "Reading")
+    # Three consecutive days (10-12 Dec) plus two isolated days (16, 18 Dec).
+    _complete(
+        client,
+        auth_headers,
+        habit_id,
+        [date(2024, 12, d) for d in (10, 11, 12, 16, 18)],
+    )
+
+    rng = {"date_start": "01-12-2024", "date_end": "31-12-2024"}
+    response = client.get(
+        f"/api/v1/habits/{habit_id}/stats", params=rng, headers=auth_headers
+    )
+    assert response.status_code == 200
+    stats = response.json()
+
+    # Streak: most recent run is the isolated 18 Dec (1); longest run is 10-12 (3).
+    assert stats["streak"] == {
+        "current": 1,
+        "longest": 3,
+        "total": 5,
+        "segments": [3, 1, 1],
+    }
+
+    # No period configured -> no period progress.
+    assert stats["period_progress"] is None
+    assert stats["period"] is None
+
+    # Heatmap interval counts over the December window.
+    assert stats["heatmap"]["done_days"] == 5
+    assert stats["heatmap"]["period_done_days"] == 0
+    assert stats["heatmap"]["active_days"] == 5
+    assert stats["heatmap"]["total_days"] == 31
+
+    # Monthly trend: a single month with all five completions.
+    assert stats["monthly_trend"] == [{"month": "2024-12", "count": 5}]
+
+    # The list endpoint must agree with the single-habit endpoint for this habit.
+    listed = client.get(
+        "/api/v1/habits/stats", params=rng, headers=auth_headers
+    ).json()
+    match = [h for h in listed if h["id"] == habit_id]
+    assert len(match) == 1
+    assert match[0] == stats
+
+
+def test_stats_periodic_habit(auth_headers, client: TestClient):
+    """A periodic habit (3 times / week) reports period completion + PERIOD_DONE."""
+    habit_id = _create_habit(client, auth_headers, "Gym")
+    response = client.put(
+        f"/api/v1/habits/{habit_id}",
+        json={"period": {"period_type": "W", "period_count": 1, "target_count": 3}},
+        headers=auth_headers,
+    )
+    assert response.status_code == 200
+
+    # Tick three days inside a single ISO week (Mon/Tue/Wed of that week).
+    monday = date(2024, 12, 2) - timedelta(days=date(2024, 12, 2).weekday())
+    _complete(client, auth_headers, habit_id, [monday + timedelta(days=i) for i in range(3)])
+
+    rng = {
+        "date_start": (monday - timedelta(days=7)).strftime(FMT),
+        "date_end": (monday + timedelta(days=14)).strftime(FMT),
+    }
+    stats = client.get(
+        f"/api/v1/habits/{habit_id}/stats", params=rng, headers=auth_headers
+    ).json()
+
+    pp = stats["period_progress"]
+    assert pp is not None
+    assert pp["period_type"] == "W"
+    assert pp["target_count"] == 3
+    # Exactly one of the tiled weeks met the target of 3.
+    assert pp["completed_periods"] == 1
+    assert pp["completion_rate"] > 0
+    # The current (last) window contains no ticks.
+    assert pp["current_period_done"] == 0
+    assert pp["current_period_completed"] is False
+
+    # The whole completed week is marked PERIOD_DONE (7 days), with 3 explicit ticks.
+    assert stats["heatmap"]["done_days"] == 3
+    assert stats["heatmap"]["period_done_days"] == 7
+    assert stats["heatmap"]["active_days"] == 7
+    # Streak counts the union of DONE + PERIOD_DONE -> one consecutive run of 7.
+    assert stats["streak"]["total"] == 7
+    assert stats["streak"]["longest"] == 7
+
+
+def test_stats_empty_habit(auth_headers, client: TestClient):
+    """A habit with no completions returns zeroed stats without errors."""
+    habit_id = _create_habit(client, auth_headers, "Meditate")
+
+    stats = client.get(
+        f"/api/v1/habits/{habit_id}/stats", headers=auth_headers
+    ).json()
+
+    assert stats["streak"] == {"current": 0, "longest": 0, "total": 0, "segments": []}
+    assert stats["period_progress"] is None
+    # Default range is the last 365 days -> 365 calendar days, all empty.
+    assert stats["heatmap"]["done_days"] == 0
+    assert stats["heatmap"]["period_done_days"] == 0
+    assert stats["heatmap"]["active_days"] == 0
+    assert stats["heatmap"]["total_days"] == 365
+    assert stats["heatmap"]["completion_rate"] == 0.0
+    # Monthly trend is present and every month is zero.
+    assert len(stats["monthly_trend"]) >= 1
+    assert all(point["count"] == 0 for point in stats["monthly_trend"])
+
+
+def test_stats_empty_periodic_habit(auth_headers, client: TestClient):
+    """A periodic habit with no completions reports a 0% period completion rate."""
+    habit_id = _create_habit(client, auth_headers, "Call parents")
+    client.put(
+        f"/api/v1/habits/{habit_id}",
+        json={"period": {"period_type": "W", "period_count": 1, "target_count": 2}},
+        headers=auth_headers,
+    )
+
+    stats = client.get(
+        f"/api/v1/habits/{habit_id}/stats", headers=auth_headers
+    ).json()
+
+    pp = stats["period_progress"]
+    assert pp is not None
+    assert pp["target_count"] == 2
+    assert pp["completed_periods"] == 0
+    assert pp["completion_rate"] == 0.0
+    assert pp["current_period_done"] == 0
+    assert pp["current_period_completed"] is False
+    assert stats["streak"]["total"] == 0
+
+
+def test_stats_date_range_filtering(auth_headers, client: TestClient):
+    """Completions outside the queried range are excluded from the figures."""
+    habit_id = _create_habit(client, auth_headers, "Walk")
+    _complete(client, auth_headers, habit_id, [date(2024, 6, 15), date(2024, 12, 15)])
+
+    june = client.get(
+        f"/api/v1/habits/{habit_id}/stats",
+        params={"date_start": "01-06-2024", "date_end": "30-06-2024"},
+        headers=auth_headers,
+    ).json()
+    assert june["heatmap"]["done_days"] == 1
+    assert june["streak"]["total"] == 1
+
+    full = client.get(
+        f"/api/v1/habits/{habit_id}/stats",
+        params={"date_start": "01-06-2024", "date_end": "31-12-2024"},
+        headers=auth_headers,
+    ).json()
+    assert full["heatmap"]["done_days"] == 2
+    assert full["streak"]["total"] == 2
+
+
+def test_stats_list_sorting(auth_headers, client: TestClient):
+    """The list endpoint sorts by the requested field and direction."""
+    alpha = _create_habit(client, auth_headers, "Alpha")
+    beta = _create_habit(client, auth_headers, "Beta")
+    # Alpha: a 1-day run ending on 20 Dec; Beta: a 3-day run ending on 20 Dec.
+    _complete(client, auth_headers, alpha, [date(2024, 12, 20)])
+    _complete(
+        client,
+        auth_headers,
+        beta,
+        [date(2024, 12, 18), date(2024, 12, 19), date(2024, 12, 20)],
+    )
+
+    rng = {"date_start": "01-12-2024", "date_end": "20-12-2024"}
+
+    desc = client.get(
+        "/api/v1/habits/stats",
+        params={**rng, "sort_by": "current_streak", "sort": "desc"},
+        headers=auth_headers,
+    ).json()
+    order = [h["id"] for h in desc]
+    assert order.index(beta) < order.index(alpha)
+    assert next(h for h in desc if h["id"] == beta)["streak"]["current"] == 3
+    assert next(h for h in desc if h["id"] == alpha)["streak"]["current"] == 1
+
+    asc = client.get(
+        "/api/v1/habits/stats",
+        params={**rng, "sort_by": "current_streak", "sort": "asc"},
+        headers=auth_headers,
+    ).json()
+    asc_order = [h["id"] for h in asc]
+    assert asc_order.index(alpha) < asc_order.index(beta)
+
+
+def test_stats_validation_and_not_found(auth_headers, sample_habit, client: TestClient):
+    """Invalid sort/range params return 400; unknown habit returns 404."""
+    # Unknown habit
+    response = client.get("/api/v1/habits/nonexistent123/stats", headers=auth_headers)
+    assert response.status_code == 404
+
+    # Invalid sort direction
+    response = client.get(
+        "/api/v1/habits/stats", params={"sort": "sideways"}, headers=auth_headers
+    )
+    assert response.status_code == 400
+
+    # Invalid sort_by field
+    response = client.get(
+        "/api/v1/habits/stats", params={"sort_by": "bogus"}, headers=auth_headers
+    )
+    assert response.status_code == 400
+
+    # Reversed date range
+    response = client.get(
+        "/api/v1/habits/stats",
+        params={"date_start": "31-12-2024", "date_end": "01-12-2024"},
+        headers=auth_headers,
+    )
+    assert response.status_code == 400
+
+    # Invalid date format
+    response = client.get(
+        f"/api/v1/habits/{sample_habit['id']}/stats",
+        params={"date_start": "2024-12-01"},
+        headers=auth_headers,
+    )
+    assert response.status_code == 400

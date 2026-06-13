@@ -18,6 +18,7 @@ from beaverhabits.configs import TagSelectionMode, settings
 from beaverhabits.core.backup import backup_to_telegram
 from beaverhabits.core.completions import CStatus, get_habit_date_completion
 from beaverhabits.core.note import update_square_style_context
+from beaverhabits.core.statistics import build_streak_segments
 from beaverhabits.frontend import icons
 from beaverhabits.frontend.javascript import force_checkbox_blur
 from beaverhabits.frontend.textarea import Textarea
@@ -944,21 +945,12 @@ def compose_habit_streaks(today: datetime.date, habit: Habit):
     if len(dates) <= 1:
         return
 
-    # find the streaks of the dates
-    months, data = [], []
-    streak_count = 1
-    for i in range(1, len(dates)):
-        if (dates[i] - dates[i - 1]).days == -1:
-            streak_count += 1
-        else:
-            months.insert(0, dates[i - 1])
-            data.insert(0, streak_count)
-            streak_count = 1
-            if len(months) >= 5:
-                break
-    else:
-        months.insert(0, dates[-1])
-        data.insert(0, streak_count)
+    # Shared streak grouping (see core.statistics.build_streak_segments) so the
+    # web chart/badge and the /habits/stats API never diverge. Keep the 5
+    # most-recent segments to match the original chart length.
+    segments = build_streak_segments(dates)[-5:]
+    months = [boundary for boundary, _ in segments]
+    data = [length for _, length in segments]
 
     return {"months": months, "data": data}
 
