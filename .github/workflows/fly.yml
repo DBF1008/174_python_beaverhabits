@@ -1,0 +1,45 @@
+name: Fly Deploy
+on:
+  push:
+    branches:
+      - main
+
+jobs:
+  pre-deploy-test:
+    uses: ./.github/workflows/pre-deployment-test.yml
+
+  deploy:
+    name: Deploy app
+    runs-on: ubuntu-latest
+    needs: pre-deploy-test
+    concurrency: deploy-group # optional: ensure only one action runs at a time
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          filter: tree:0
+      - name: Build beaverhabits-landing and copy dist
+        run: |
+          rm -rf statics/astro/dist
+          git clone --depth 1 --branch main https://oauth2:${{ secrets.GH_PAT }}@github.com/daya0576/beaverhabits-landing.git landing_tmp
+          cd landing_tmp
+          npm ci
+          npm run build
+          cd ..
+          mkdir -p statics/astro/dist
+          cp -r landing_tmp/dist/* statics/astro/dist/
+          rm -rf landing_tmp
+        env:
+          PADDLE_CLIENT_SIDE_TOKEN: ${{ vars.PADDLE_CLIENT_SIDE_TOKEN }}
+          PADDLE_PRICE_ID: ${{ vars.PADDLE_PRICE_ID }}
+
+      - name: Generate Version Info
+        run: |
+          GIT_HASH=$(git rev-parse --short HEAD)
+          GIT_TAG=$(git describe --tags --abbrev=0)
+          echo "IDENTITY = \"beaverhabits/${GIT_TAG}@${GIT_HASH}\"" > ${{ github.workspace }}/beaverhabits/version.py
+
+      - uses: superfly/flyctl-actions/setup-flyctl@master
+      - run: flyctl deploy --remote-only
+        env:
+          FLY_API_TOKEN: ${{ secrets.FLY_API_TOKEN }}
