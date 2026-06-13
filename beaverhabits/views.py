@@ -117,9 +117,34 @@ async def get_or_create_user_habit_list(user: User, habit_list: HabitList) -> Ha
     return await get_user_habit_list(user)
 
 
-async def export_user_habit_list(habit_list: HabitList, user_identify: str) -> bool:
-    habits = HabitListBuilder(habit_list).status(HabitStatus.ACTIVE).build()
+def dump_habit_list(habit_list: DictHabitList) -> dict:
+    """Serialize a habit list for export / sharing.
 
+    Includes active and archived habits (soft-deleted ones are omitted) with
+    their full history and metadata, plus the list ordering and sort mode, so
+    the file can be re-imported to reproduce the workspace. Backup credentials
+    are intentionally excluded so the exported file is safe to share.
+    """
+    habits = (
+        HabitListBuilder(habit_list)
+        .status(HabitStatus.ACTIVE, HabitStatus.ARCHIVED)
+        .build()
+    )
+
+    dumped: dict = {"habits": []}
+    for habit in habits:
+        # Materialize the id so a re-import matches habits instead of cloning.
+        habit.id
+        dumped["habits"].append(habit.to_dict())
+
+    if habit_list.order:
+        dumped["order"] = list(habit_list.order)
+    dumped["order_by"] = habit_list.order_by.value
+
+    return dumped
+
+
+async def export_user_habit_list(habit_list: HabitList, user_identify: str) -> bool:
     # json to binary
     now = datetime.datetime.now()
     if not isinstance(habit_list, DictHabitList):
@@ -128,7 +153,7 @@ async def export_user_habit_list(habit_list: HabitList, user_identify: str) -> b
     export_d = {
         "user_email": user_identify,
         "exported_at": now.strftime("%Y-%m-%d %H:%M:%S"),
-        "habits": [habit.to_dict() for habit in habits],
+        **dump_habit_list(habit_list),
     }
     binary_data = json.dumps(export_d).encode()
     file_name = f"beaverhabits_{now.strftime('%Y_%m_%d')}.json"

@@ -147,7 +147,7 @@ class DictHabit(Habit[DictRecord], DictStorage):
 
         try:
             return HabitFrequency.from_dict(period_value)
-        except ValueError:
+        except (ValueError, KeyError, TypeError):
             logger.error(f"Invalid period value: {period_value}")
             self.data["period"] = None
             return None
@@ -215,12 +215,55 @@ class DictHabit(Habit[DictRecord], DictStorage):
         return self.ticked_data[day]
 
     async def merge(self, other: "DictHabit") -> None:
-        self_ticks = {r.day for r in self.records if r.done}
-        other_ticks = {r.day for r in other.records if r.done}
-        result = sorted(list(self_ticks | other_ticks))
-        self.data["records"] = [
-            {"day": day.strftime(DAY_MASK), "done": True} for day in result
-        ]
+        """Merge another habit's history and metadata into this one.
+
+        History is unioned by day, preserving record notes and days that are
+        only annotated (not done). ``done`` is OR-ed across both copies and the
+        note prefers this habit's text, falling back to the other's, so an
+        import never silently overwrites existing data. Metadata missing here
+        (tags, chips, period, star) is filled in from ``other`` while existing
+        non-empty values are kept.
+        """
+        # Union records by day so notes and not-done-but-noted days survive.
+        merged: dict[str, dict] = {}
+        for record in (
+            *self.data.get("records", []),
+            *other.data.get("records", []),
+        ):
+            day = record.get("day")
+            if not day:
+                continue
+            done = bool(record.get("done", False))
+            text = record.get("text") or ""
+            existing = merged.get(day)
+            if existing is None:
+                merged[day] = {"day": day, "done": done, "text": text}
+            else:
+                existing["done"] = existing["done"] or done
+                if not existing["text"]:
+                    existing["text"] = text
+
+        # Re-emit every recorded day so export -> import round-trips exactly.
+        records = []
+        for day in sorted(merged):
+            entry = merged[day]
+            record = {"day": entry["day"], "done": entry["done"]}
+            if entry["text"]:
+                record["text"] = entry["text"]
+            records.append(record)
+        self.data["records"] = records
+
+        # Fill in metadata this habit is missing; never clobber existing values.
+        if not self.tags and other.tags:
+            self.tags = other.tags
+        if not self.chips and other.chips:
+            self.chips = other.chips
+        if self.period is None and other.period is not None:
+            self.period = other.period
+        if not self.star and other.star:
+            self.star = other.star
+
+        self.cache.refresh()
 
     def copy(self) -> "Habit":
         new_data = {
@@ -310,15 +353,52 @@ class DictHabitList(HabitList[DictHabit], DictStorage):
         self.data["habits"].remove(item.data)
 
     async def merge(self, other: "DictHabitList") -> None:
-        # Add new habits
-        active_habits = [h for h in self.habits if h.status == HabitStatus.ACTIVE]
-        added = set(other.habits) - set(active_habits)
-        for habit in added:
-            habit.name = f"{habit.name} (imported)"
-            self.data["habits"].append(habit.data)
+        """Merge another habit list into this one (import / restore).
 
-        # Merge the habit if it exists
-        for self_habit in self.habits:
-            for other_habit in other.habits:
-                if self_habit == other_habit:
-                    await self_habit.merge(other_habit)
+        ``self`` is the destination workspace and ``other`` the imported data.
+        Habits are matched by id across *every* status, so a re-imported
+        archived (or soft-deleted) habit is updated in place instead of being
+        duplicated. Habits not present here are appended verbatim, keeping their
+        full history, notes, tags, period and status. List-level ordering, sort
+        mode and backup settings are restored from ``other`` where this list
+        does not already define them, so a restore onto an empty workspace
+        reproduces it exactly while a merge into a live workspace keeps the
+        local arrangement.
+        """
+        self_by_id = {habit.id: habit for habit in self.habits}
+        existing_names = {habit.name for habit in self.habits}
+
+        for other_habit in other.habits:
+            self_habit = self_by_id.get(other_habit.id)
+            if self_habit is not None:
+                # Same habit -> merge history and metadata in place.
+                await self_habit.merge(other_habit)
+                continue
+
+            # New habit -> add it, disambiguating only on a real name clash.
+            if other_habit.name in existing_names:
+                other_habit.name = f"{other_habit.name} (imported)"
+            existing_names.add(other_habit.name)
+            self.data["habits"].append(other_habit.data)
+            self_by_id[other_habit.id] = other_habit
+
+        self._merge_meta(other)
+
+    def _merge_meta(self, other: "DictHabitList") -> None:
+        # Preserve the current arrangement, then slot in anything new from the
+        # import followed by any habit still missing from the order list.
+        order = list(self.order)
+        seen = set(order)
+        for habit_id in (*other.order, *(h.id for h in self.habits)):
+            if habit_id not in seen:
+                order.append(habit_id)
+                seen.add(habit_id)
+        if order:
+            self.order = order
+
+        # Adopt sort mode / backup only when this list has not set its own.
+        if "order_by" not in self.data and other.data.get("order_by") is not None:
+            self.order_by = other.order_by
+
+        if not self.backup.telegram_bot_token and other.backup.telegram_bot_token:
+            self.backup = other.backup

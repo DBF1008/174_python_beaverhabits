@@ -77,7 +77,13 @@ def import_ui_page(user: User):
                 raise ValueError("Unsupported format")
 
             habit_list = await user_storage.get_user_habit_list(user)
-            habits = HabitListBuilder(habit_list).status(HabitStatus.ACTIVE).build()
+            # Diff against every status (the merge matches habits by id across
+            # all statuses) so the dialog reports accurate add/merge counts.
+            habits = (
+                HabitListBuilder(habit_list)
+                .status(HabitStatus.ACTIVE, HabitStatus.ARCHIVED)
+                .build()
+            )
 
             added = set(other.habits) - set(habits)
             merged = set(other.habits) & set(habits)
