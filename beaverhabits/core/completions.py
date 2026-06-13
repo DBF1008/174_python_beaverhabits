@@ -1,5 +1,6 @@
 import datetime
 from collections import defaultdict
+from dataclasses import dataclass
 from enum import Enum, auto
 
 from beaverhabits.logger import logger
@@ -85,3 +86,45 @@ def get_habit_date_completion(
         for day, status in completion.items():
             result[day].append(status)
     return result
+
+
+@dataclass
+class JournalEntry:
+    """A single structured completion-journal record.
+
+    Built from a stored record rather than the derived completion map, so
+    note-only records with ``done=False`` are included. ``statuses`` carries the
+    completion classification for the day (e.g. ``DONE``, ``PERIOD_DONE``).
+    """
+
+    day: datetime.date
+    done: bool
+    text: str
+    statuses: list[CStatus]
+
+
+def get_completion_journal(
+    habit: Habit, start: datetime.date, end: datetime.date
+) -> list[JournalEntry]:
+    """Return one journal entry per stored record within [start, end].
+
+    Unlike :func:`get_habit_date_completion`, this is record-driven: every
+    persisted record in range is returned, including ``done=False`` records that
+    only carry a note. The completion classification for each day is looked up
+    from :func:`get_habit_date_completion`.
+    """
+    status_map = get_habit_date_completion(habit, start, end)
+    entries = []
+    for record in habit.records:
+        day = record.day
+        if not (start <= day <= end):
+            continue
+        entries.append(
+            JournalEntry(
+                day=day,
+                done=record.done,
+                text=record.text,
+                statuses=status_map.get(day, []),
+            )
+        )
+    return entries

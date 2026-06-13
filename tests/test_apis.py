@@ -711,3 +711,300 @@ def test_complete_nonexistent_habit(auth_headers, client: TestClient):
         headers=auth_headers,
     )
     assert response.status_code == 404
+
+
+# ============================================================================
+# Completion Journal Tests (structured: date / done / notes / completion_type)
+# ============================================================================
+
+JOURNAL_FMT = "%d-%m-%Y"
+
+
+def _tick(client, headers, habit_id, date_str, done, text=None):
+    """Create/update a completion record through the public POST endpoint."""
+    payload = {"date_fmt": JOURNAL_FMT, "date": date_str, "done": done}
+    if text is not None:
+        payload["text"] = text
+    resp = client.post(
+        f"/api/v1/habits/{habit_id}/completions", json=payload, headers=headers
+    )
+    assert resp.status_code == 200
+    return resp
+
+
+def _journal(client, headers, habit_id, **params):
+    """GET the completion journal for a habit with the default date format."""
+    params.setdefault("date_fmt", JOURNAL_FMT)
+    return client.get(
+        f"/api/v1/habits/{habit_id}/completions/journal",
+        params=params,
+        headers=headers,
+    )
+
+
+def _entry_for(entries, date_str):
+    """Return the single journal entry for a date (asserting uniqueness)."""
+    matches = [e for e in entries if e["date"] == date_str]
+    assert len(matches) == 1, f"expected one entry for {date_str}, got {matches}"
+    return matches[0]
+
+
+def test_journal_normal_check(auth_headers, sample_habit, client: TestClient):
+    """普通勾选: a plain done=True check-in appears with done=True and DONE type."""
+    _tick(client, auth_headers, sample_habit["id"], "10-12-2024", True)
+
+    resp = _journal(
+        client,
+        auth_headers,
+        sample_habit["id"],
+        date_start="01-12-2024",
+        date_end="31-12-2024",
+    )
+
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["habit_id"] == sample_habit["id"]
+    assert body["total"] == 1
+    entry = _entry_for(body["entries"], "10-12-2024")
+    assert entry["done"] is True
+    assert entry["notes"] == ""
+    assert "DONE" in entry["completion_type"]
+    assert "PERIOD_DONE" not in entry["completion_type"]
+
+
+def test_journal_done_with_note(auth_headers, sample_habit, client: TestClient):
+    """备注记录: a done check-in carrying a note exposes the note text."""
+    _tick(client, auth_headers, sample_habit["id"], "10-12-2024", True, text="ran 5k")
+
+    resp = _journal(
+        client,
+        auth_headers,
+        sample_habit["id"],
+        date_start="01-12-2024",
+        date_end="31-12-2024",
+    )
+
+    assert resp.status_code == 200
+    entry = _entry_for(resp.json()["entries"], "10-12-2024")
+    assert entry["done"] is True
+    assert entry["notes"] == "ran 5k"
+    assert "DONE" in entry["completion_type"]
+
+
+def test_journal_note_only_record(auth_headers, sample_habit, client: TestClient):
+    """备注记录: a done=False record that only carries a note is still returned.
+
+    The legacy date-list endpoint filters on completion status, so these
+    note-only records were previously invisible to external clients.
+    """
+    _tick(
+        client, auth_headers, sample_habit["id"], "11-12-2024", False, text="rest day"
+    )
+
+    resp = _journal(
+        client,
+        auth_headers,
+        sample_habit["id"],
+        date_start="01-12-2024",
+        date_end="31-12-2024",
+    )
+
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["total"] == 1
+    entry = _entry_for(body["entries"], "11-12-2024")
+    assert entry["done"] is False
+    assert entry["notes"] == "rest day"
+    assert entry["completion_type"] == []
+
+
+def test_journal_periodic_habit_period_done(
+    auth_headers, sample_habit, client: TestClient
+):
+    """周期习惯: when a weekly target is met, those days are marked PERIOD_DONE."""
+    habit_id = sample_habit["id"]
+    # Target: 2 completions per 1 week.
+    put = client.put(
+        f"/api/v1/habits/{habit_id}",
+        json={"period": {"period_type": "W", "period_count": 1, "target_count": 2}},
+        headers=auth_headers,
+    )
+    assert put.status_code == 200
+
+    # 2024-12-09 (Mon) and 2024-12-10 (Tue) fall in the same ISO week -> target met.
+    _tick(client, auth_headers, habit_id, "09-12-2024", True)
+    _tick(client, auth_headers, habit_id, "10-12-2024", True)
+
+    resp = _journal(
+        client,
+        auth_headers,
+        habit_id,
+        date_start="09-12-2024",
+        date_end="15-12-2024",
+    )
+
+    assert resp.status_code == 200
+    entries = resp.json()["entries"]
+    for d in ("09-12-2024", "10-12-2024"):
+        entry = _entry_for(entries, d)
+        assert entry["done"] is True
+        assert "PERIOD_DONE" in entry["completion_type"]
+        assert "DONE" in entry["completion_type"]
+
+
+def test_journal_periodic_below_target_not_period_done(
+    auth_headers, sample_habit, client: TestClient
+):
+    """周期习惯: a single check-in below the weekly target is DONE but not PERIOD_DONE."""
+    habit_id = sample_habit["id"]
+    client.put(
+        f"/api/v1/habits/{habit_id}",
+        json={"period": {"period_type": "W", "period_count": 1, "target_count": 2}},
+        headers=auth_headers,
+    )
+    _tick(client, auth_headers, habit_id, "09-12-2024", True)
+
+    resp = _journal(
+        client,
+        auth_headers,
+        habit_id,
+        date_start="09-12-2024",
+        date_end="15-12-2024",
+    )
+
+    assert resp.status_code == 200
+    entry = _entry_for(resp.json()["entries"], "09-12-2024")
+    assert entry["completion_type"] == ["DONE"]
+
+
+def test_journal_time_range_filter(auth_headers, sample_habit, client: TestClient):
+    """Records outside the requested range are excluded from the journal."""
+    habit_id = sample_habit["id"]
+    _tick(client, auth_headers, habit_id, "05-12-2024", True)
+    _tick(client, auth_headers, habit_id, "20-12-2024", True)
+
+    resp = _journal(
+        client,
+        auth_headers,
+        habit_id,
+        date_start="10-12-2024",
+        date_end="31-12-2024",
+    )
+
+    assert resp.status_code == 200
+    body = resp.json()
+    dates = [e["date"] for e in body["entries"]]
+    assert "20-12-2024" in dates
+    assert "05-12-2024" not in dates
+    assert body["total"] == 1
+
+
+def test_journal_sort_desc(auth_headers, sample_habit, client: TestClient):
+    """Entries can be sorted by date in descending order."""
+    habit_id = sample_habit["id"]
+    for d in ("05-12-2024", "10-12-2024", "20-12-2024"):
+        _tick(client, auth_headers, habit_id, d, True)
+
+    resp = _journal(
+        client,
+        auth_headers,
+        habit_id,
+        date_start="01-12-2024",
+        date_end="31-12-2024",
+        sort="desc",
+    )
+
+    assert resp.status_code == 200
+    dates = [e["date"] for e in resp.json()["entries"]]
+    assert dates == ["20-12-2024", "10-12-2024", "05-12-2024"]
+
+
+def test_journal_pagination(auth_headers, sample_habit, client: TestClient):
+    """limit/offset page through entries and total reflects the full match count."""
+    habit_id = sample_habit["id"]
+    for day in range(1, 8):  # 7 records: 01..07 December
+        _tick(client, auth_headers, habit_id, f"{day:02d}-12-2024", True)
+
+    common = dict(date_start="01-12-2024", date_end="31-12-2024", sort="asc", limit=3)
+
+    p1 = _journal(client, auth_headers, habit_id, offset=0, **common).json()
+    assert p1["total"] == 7
+    assert p1["limit"] == 3
+    assert p1["offset"] == 0
+    assert [e["date"] for e in p1["entries"]] == [
+        "01-12-2024",
+        "02-12-2024",
+        "03-12-2024",
+    ]
+
+    p2 = _journal(client, auth_headers, habit_id, offset=3, **common).json()
+    assert p2["total"] == 7
+    assert [e["date"] for e in p2["entries"]] == [
+        "04-12-2024",
+        "05-12-2024",
+        "06-12-2024",
+    ]
+
+    p3 = _journal(client, auth_headers, habit_id, offset=6, **common).json()
+    assert p3["total"] == 7
+    assert [e["date"] for e in p3["entries"]] == ["07-12-2024"]
+
+
+def test_journal_invalid_params(auth_headers, sample_habit, client: TestClient):
+    """Bad date/sort -> 400; out-of-range limit -> 422 (FastAPI Query validation)."""
+    habit_id = sample_habit["id"]
+
+    # Wrong date format for the given date_fmt.
+    assert _journal(client, auth_headers, habit_id, date_start="2024-12-01").status_code == 400
+    # date_start after date_end.
+    assert (
+        _journal(
+            client,
+            auth_headers,
+            habit_id,
+            date_start="31-12-2024",
+            date_end="01-12-2024",
+        ).status_code
+        == 400
+    )
+    # Invalid sort value.
+    assert _journal(client, auth_headers, habit_id, sort="sideways").status_code == 400
+    # limit below the allowed minimum.
+    assert _journal(client, auth_headers, habit_id, limit=0).status_code == 422
+
+
+def test_journal_requires_auth(sample_habit, client: TestClient):
+    """无权限访问: a request without an Authorization header is rejected (401)."""
+    resp = client.get(f"/api/v1/habits/{sample_habit['id']}/completions/journal")
+    assert resp.status_code == 401
+
+
+def test_journal_nonexistent_habit(auth_headers, client: TestClient):
+    """无权限访问: an unknown habit id returns 404."""
+    resp = _journal(client, auth_headers, "nonexistent123")
+    assert resp.status_code == 404
+
+
+def test_journal_cross_user_forbidden(auth_headers, sample_habit, client: TestClient):
+    """无权限访问: a different user cannot read someone else's journal (404)."""
+    # sample_habit belongs to the first user (auth_headers). Register a second user.
+    other_email = f"other_{datetime.now().timestamp()}@test.com"
+    reg = client.post(
+        "/auth/register", json={"email": other_email, "password": PASSWORD}
+    )
+    assert reg.status_code == 201
+
+    login = client.post(
+        "/auth/login",
+        data={
+            "grant_type": "password",
+            "username": other_email,
+            "password": PASSWORD,
+        },
+        headers={"content-type": "application/x-www-form-urlencoded"},
+    )
+    assert login.status_code == 200
+    other_headers = {"Authorization": f"Bearer {login.json()['access_token']}"}
+
+    resp = _journal(client, other_headers, sample_habit["id"])
+    assert resp.status_code == 404

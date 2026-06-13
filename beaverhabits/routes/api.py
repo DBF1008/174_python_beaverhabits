@@ -8,7 +8,11 @@ from pydantic import BaseModel
 from beaverhabits import views
 from beaverhabits.app.db import User
 from beaverhabits.app.dependencies import current_active_user
-from beaverhabits.core.completions import CStatus, get_habit_date_completion
+from beaverhabits.core.completions import (
+    CStatus,
+    get_completion_journal,
+    get_habit_date_completion,
+)
 from beaverhabits.storage.storage import (
     Habit,
     HabitFrequency,
@@ -187,6 +191,76 @@ async def get_habit_completions(
         ticked_days = ticked_days[:limit]
 
     return [x.strftime(date_fmt) for x in ticked_days]
+
+
+class CompletionJournalEntry(BaseModel):
+    date: str
+    done: bool
+    notes: str
+    completion_type: list[str]
+
+
+class CompletionJournalResponse(BaseModel):
+    habit_id: str
+    total: int
+    limit: int
+    offset: int
+    entries: list[CompletionJournalEntry]
+
+
+@api_router.get("/habits/{habit_id}/completions/journal", tags=["habits"])
+async def get_habit_completion_journal(
+    habit_id: str,
+    date_fmt: str = "%d-%m-%Y",
+    date_start: str | None = None,
+    date_end: str | None = None,
+    sort: str = "asc",
+    limit: int = Query(default=50, ge=1, le=1000),
+    offset: int = Query(default=0, ge=0),
+    user: User = Depends(current_active_user),
+):
+    # Parse date range
+    start, end = datetime.date.min, datetime.date.max
+    if date_start:
+        try:
+            start = datetime.datetime.strptime(date_start, date_fmt.strip()).date()
+        except ValueError:
+            raise HTTPException(status_code=400, detail="Invalid date format")
+    if date_end:
+        try:
+            end = datetime.datetime.strptime(date_end, date_fmt.strip()).date()
+        except ValueError:
+            raise HTTPException(status_code=400, detail="Invalid date format")
+    if start > end:
+        raise HTTPException(
+            status_code=400, detail="date_start cannot be after date_end"
+        )
+
+    if sort not in ("asc", "desc"):
+        raise HTTPException(status_code=400, detail="Invalid sort value")
+
+    habit = await views.get_user_habit(user, habit_id)
+    entries = get_completion_journal(habit, start, end)
+    entries.sort(key=lambda e: e.day, reverse=sort == "desc")
+
+    total = len(entries)
+    page = entries[offset : offset + limit]
+
+    return CompletionJournalResponse(
+        habit_id=habit_id,
+        total=total,
+        limit=limit,
+        offset=offset,
+        entries=[
+            CompletionJournalEntry(
+                date=e.day.strftime(date_fmt),
+                done=e.done,
+                notes=e.text,
+                completion_type=[s.name for s in e.statuses],
+            )
+            for e in page
+        ],
+    )
 
 
 class Tick(BaseModel):
