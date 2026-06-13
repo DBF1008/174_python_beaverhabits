@@ -48,6 +48,8 @@ async def item_drop(e, habit_list: HabitList):
     # Update order
     habit_list.order = [str(x.id) for x in habits]
     habit_list.order_by = HabitOrder.MANUALLY
+    # Ensure no stale IDs linger from prior state
+    habit_list.compact_order()
     logger.info(f"New order: {habits}")
 
     add_ui.refresh()
@@ -55,6 +57,9 @@ async def item_drop(e, habit_list: HabitList):
 
 @ui.refreshable
 def add_ui(habit_list: HabitList):
+    # Sync order list with actual habits before rendering
+    habit_list.compact_order()
+
     active_habits = HabitListBuilder(habit_list).status(HabitStatus.ACTIVE).build()
     archived_habits = HabitListBuilder(habit_list).status(HabitStatus.ARCHIVED).build()
     habits = [*active_habits, None, *archived_habits]

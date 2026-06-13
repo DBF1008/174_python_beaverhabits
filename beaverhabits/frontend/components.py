@@ -491,6 +491,8 @@ class HabitDeleteButton(ui.button):
             if not await self.dialog:
                 return
             self.habit.status = HabitStatus.SOLF_DELETED
+            # Clean stale ID from order list after soft-delete
+            self.habit_list.compact_order()
             logger.info(f"Soft delete habit: {self.habit.name}")
 
         self.refresh()

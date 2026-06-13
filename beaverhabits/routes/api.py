@@ -45,6 +45,8 @@ async def put_habits_meta(
 ):
     if meta.order is not None:
         habit_list.order = meta.order
+    # Remove stale IDs that no longer match any existing habit
+    habit_list.compact_order()
     return {"order": habit_list.order}
 
 

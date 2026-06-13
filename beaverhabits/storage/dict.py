@@ -300,22 +300,54 @@ class DictHabitList(HabitList[DictHabit], DictStorage):
             if habit.id == habit_id:
                 return habit
 
+    def compact_order(self) -> None:
+        """Remove stale IDs from order list.
+
+        Strips IDs that no longer match any habit, or that belong to
+        soft-deleted habits (which should no longer appear in any view).
+        """
+        valid_ids = {
+            str(h.id) for h in self.habits if h.status != HabitStatus.SOLF_DELETED
+        }
+        current = self.order
+        compacted = [oid for oid in current if oid in valid_ids]
+        if compacted != current:
+            self.order = compacted
+
     async def add(self, name: str, tags: list | None = None) -> str:
         id = generate_short_hash(name)
         d = {"name": name, "records": [], "id": id, "tags": tags or []}
         self.data["habits"].append(d)
+        # Append new habit to order list so manual sort includes it
+        order = self.order
+        if id not in order:
+            self.order = [*order, id]
         return id
 
     async def remove(self, item: DictHabit) -> None:
         self.data["habits"].remove(item.data)
+        # Remove the deleted habit ID from the order list
+        order = self.order
+        if str(item.id) in order:
+            self.order = [oid for oid in order if oid != str(item.id)]
 
     async def merge(self, other: "DictHabitList") -> None:
         # Add new habits
         active_habits = [h for h in self.habits if h.status == HabitStatus.ACTIVE]
         added = set(other.habits) - set(active_habits)
+        added_ids: list[str] = []
         for habit in added:
             habit.name = f"{habit.name} (imported)"
             self.data["habits"].append(habit.data)
+            added_ids.append(str(habit.id))
+
+        # Append imported habit IDs to order list
+        if added_ids:
+            order = list(self.order)
+            for aid in added_ids:
+                if aid not in order:
+                    order.append(aid)
+            self.order = order
 
         # Merge the habit if it exists
         for self_habit in self.habits:
