@@ -28,7 +28,7 @@ class DatabaseImageStorage(ImageStorage):
 
         return ImageObject(
             id=str(m.unique_id),
-            url=f"/assets/{m.id}",
+            url=f"/assets/{m.unique_id}",
             owner=user.email,
             blob=m.blob,
         )
