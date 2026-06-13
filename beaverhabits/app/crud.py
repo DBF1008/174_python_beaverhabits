@@ -199,6 +199,7 @@ async def get_user_image(uuid: UUID, user: User) -> UserNoteImageModel | None:
             logger.info(f"[CRUD] User {user} image retrieved: {user_image.unique_id}")
         else:
             logger.warning(f"[CRUD] User {user.id} image not found: {uuid}")
+        return user_image
 
 
 async def get_user_api_token(user: User) -> str | None:
@@ -264,4 +265,3 @@ async def get_user_by_api_token(token: str) -> User | None:
             user_result = await session.execute(user_stmt)
             return user_result.scalar()
         return None
-        return user_image
