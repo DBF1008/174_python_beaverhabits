@@ -15,6 +15,7 @@ from beaverhabits.utils import generate_short_hash
 
 DAY_MASK = "%Y-%m-%d"
 MONTH_MASK = "%Y/%m"
+SCHEMA_VERSION = 1
 
 
 @dataclass(init=False)
@@ -215,12 +216,30 @@ class DictHabit(Habit[DictRecord], DictStorage):
         return self.ticked_data[day]
 
     async def merge(self, other: "DictHabit") -> None:
-        self_ticks = {r.day for r in self.records if r.done}
-        other_ticks = {r.day for r in other.records if r.done}
-        result = sorted(list(self_ticks | other_ticks))
-        self.data["records"] = [
-            {"day": day.strftime(DAY_MASK), "done": True} for day in result
-        ]
+        # Build a map of existing records by day
+        self_by_day: dict[datetime.date, dict] = {}
+        for r in self.records:
+            self_by_day[r.day] = r.data
+
+        # Merge in other records: union by day, preserving text and done status
+        for other_r in other.records:
+            day = other_r.day
+            if day not in self_by_day:
+                # New day — adopt incoming record as a copy
+                self_by_day[day] = {k: v for k, v in other_r.data.items()}
+            else:
+                existing = self_by_day[day]
+                incoming = other_r.data
+                incoming_has_text = bool(incoming.get("text"))
+                if incoming_has_text:
+                    # Incoming has text — prefer it (richer data wins)
+                    self_by_day[day] = {k: v for k, v in incoming.items()}
+                elif incoming.get("done", False):
+                    # No text change, but promote done to True if either side was done
+                    existing["done"] = True
+
+        sorted_days = sorted(self_by_day.keys())
+        self.data["records"] = [self_by_day[day] for day in sorted_days]
 
     def copy(self) -> "Habit":
         new_data = {
@@ -270,6 +289,10 @@ class DictHabitList(HabitList[DictHabit], DictStorage):
         try:
             return HabitOrder(order_value)
         except ValueError:
+            # Backward compatibility: old data used auto() integers (1, 2, 3)
+            _legacy_map = {1: "NAME", 2: "CATEGORY", 3: "MANUALLY"}
+            if isinstance(order_value, int) and order_value in _legacy_map:
+                return HabitOrder(_legacy_map[order_value])
             logger.error(f"Invalid order value: {order_value}")
             self.data["order_by"] = None
             return HabitOrder.MANUALLY
@@ -310,15 +333,29 @@ class DictHabitList(HabitList[DictHabit], DictStorage):
         self.data["habits"].remove(item.data)
 
     async def merge(self, other: "DictHabitList") -> None:
-        # Add new habits
-        active_habits = [h for h in self.habits if h.status == HabitStatus.ACTIVE]
-        added = set(other.habits) - set(active_habits)
-        for habit in added:
-            habit.name = f"{habit.name} (imported)"
-            self.data["habits"].append(habit.data)
+        # Index existing habits by ID for O(1) lookup
+        existing_by_id: dict[str, DictHabit] = {h.id: h for h in self.habits}
 
-        # Merge the habit if it exists
-        for self_habit in self.habits:
-            for other_habit in other.habits:
-                if self_habit == other_habit:
-                    await self_habit.merge(other_habit)
+        for other_habit in other.habits:
+            if other_habit.id in existing_by_id:
+                self_habit = existing_by_id[other_habit.id]
+                # Merge records
+                await self_habit.merge(other_habit)
+                # Update all metadata from the imported side
+                self_habit.tags = other_habit.tags
+                self_habit.star = other_habit.star
+                self_habit.period = other_habit.period
+                self_habit.chips = other_habit.chips
+                self_habit.status = other_habit.status
+                self_habit.name = other_habit.name
+            else:
+                # New habit — append as-is without renaming
+                self.data["habits"].append(
+                    {k: v for k, v in other_habit.data.items()}
+                )
+
+        # Restore sort settings from the imported list
+        if other.order:
+            self.order = other.order
+        if other.order_by:
+            self.order_by = other.order_by

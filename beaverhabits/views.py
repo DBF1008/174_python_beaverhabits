@@ -25,7 +25,7 @@ from beaverhabits.core.backup import backup_to_telegram
 from beaverhabits.frontend.components import redirect
 from beaverhabits.logger import logger
 from beaverhabits.storage import get_user_dict_storage, session_storage
-from beaverhabits.storage.dict import DAY_MASK, DictHabitList
+from beaverhabits.storage.dict import DAY_MASK, DictHabitList, SCHEMA_VERSION
 from beaverhabits.storage.meta import GUI_ROOT_PATH
 from beaverhabits.storage.storage import Habit, HabitList, HabitListBuilder, HabitStatus
 from beaverhabits.utils import generate_short_hash, ratelimiter, send_email
@@ -118,16 +118,21 @@ async def get_or_create_user_habit_list(user: User, habit_list: HabitList) -> Ha
 
 
 async def export_user_habit_list(habit_list: HabitList, user_identify: str) -> bool:
-    habits = HabitListBuilder(habit_list).status(HabitStatus.ACTIVE).build()
-
-    # json to binary
-    now = datetime.datetime.now()
     if not isinstance(habit_list, DictHabitList):
         return False
 
+    # Export both active and archived habits (exclude soft-deleted)
+    habits = HabitListBuilder(habit_list).status(
+        HabitStatus.ACTIVE, HabitStatus.ARCHIVED
+    ).build()
+
+    now = datetime.datetime.now()
     export_d = {
+        "version": SCHEMA_VERSION,
         "user_email": user_identify,
         "exported_at": now.strftime("%Y-%m-%d %H:%M:%S"),
+        "order": habit_list.order,
+        "order_by": habit_list.order_by.value,
         "habits": [habit.to_dict() for habit in habits],
     }
     binary_data = json.dumps(export_d).encode()

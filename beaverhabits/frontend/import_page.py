@@ -10,26 +10,54 @@ from beaverhabits.frontend import icons
 from beaverhabits.frontend.layout import layout
 from beaverhabits.logger import logger
 from beaverhabits.storage.dict import DictHabitList
-from beaverhabits.storage.storage import HabitList, HabitListBuilder, HabitStatus
+from beaverhabits.storage.storage import HabitList, HabitListBuilder, HabitOrder, HabitStatus
 from beaverhabits.views import user_storage
 
 
 async def import_from_json(text: str) -> HabitList:
     """Import from JSON
 
-    Example:
+    Supports both the new envelope format (with version, order, order_by)
+    and the legacy raw dict format from Telegram backups.
+
+    Example envelope format:
     {
-        "habits": [
-            {
-                "name": "habit1",
-                "records": [
-                    {"day": "2021-01-01", "done": true},
-                    {"day": "2021-01-02", "done": false}
-                ]
-            },
-            ...
+        "version": 1,
+        "user_email": "user@example.com",
+        "exported_at": "2024-01-01 12:00:00",
+        "order": ["abc123", ...],
+        "order_by": "MANUALLY",
+        "habits": [...]
+    }
+
+    Example legacy format (Telegram backup):
+    {
+        "habits": [...],
+        "order": [...],
+        "order_by": "MANUALLY",
+        "backup": {...}
+    }
     """
-    habit_list = DictHabitList(json.loads(text))
+    parsed = json.loads(text)
+
+    # Extract envelope fields before constructing DictHabitList
+    order = parsed.pop("order", None)
+    order_by = parsed.pop("order_by", None)
+    parsed.pop("version", None)
+    parsed.pop("user_email", None)
+    parsed.pop("exported_at", None)
+
+    habit_list = DictHabitList(parsed)
+
+    # Restore sort settings if present
+    if order is not None:
+        habit_list.order = order
+    if order_by is not None:
+        try:
+            habit_list.order_by = HabitOrder(order_by)
+        except ValueError:
+            pass
+
     if not habit_list.habits:
         raise ValueError("No habits found")
     return habit_list
@@ -77,7 +105,7 @@ def import_ui_page(user: User):
                 raise ValueError("Unsupported format")
 
             habit_list = await user_storage.get_user_habit_list(user)
-            habits = HabitListBuilder(habit_list).status(HabitStatus.ACTIVE).build()
+            habits = habit_list.habits
 
             added = set(other.habits) - set(habits)
             merged = set(other.habits) & set(habits)

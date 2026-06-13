@@ -1,7 +1,7 @@
 import datetime
 import re
 from dataclasses import asdict, dataclass
-from enum import Enum, auto
+from enum import Enum
 from typing import List, Literal, Optional, Protocol, Self
 
 from dataclasses_json import DataClassJsonMixin
@@ -173,9 +173,9 @@ class Habit[R: CheckedRecord](Protocol):
 
 
 class HabitOrder(Enum):
-    NAME = auto()
-    CATEGORY = auto()
-    MANUALLY = auto()
+    NAME = "NAME"
+    CATEGORY = "CATEGORY"
+    MANUALLY = "MANUALLY"
 
 
 @dataclass
