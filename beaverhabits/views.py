@@ -2,14 +2,13 @@ import asyncio
 import datetime
 import json
 import random
-import re
 from dataclasses import dataclass
 from typing import Sequence
 
 from fastapi import HTTPException
 from nicegui import app, run, ui
 
-from beaverhabits.app import crud
+from beaverhabits.app import crud, preferences
 from beaverhabits.app.auth import (
     user_check_token,
     user_create,
@@ -20,6 +19,11 @@ from beaverhabits.app.auth import (
 )
 from beaverhabits.app.crud import get_customer_list, get_user_count, get_user_list
 from beaverhabits.app.db import User
+from beaverhabits.app.preferences import (
+    UserPreferences,
+    UserPreferencesUpdate,
+    sanitize_css,
+)
 from beaverhabits.configs import settings
 from beaverhabits.core.backup import backup_to_telegram
 from beaverhabits.frontend.components import redirect
@@ -28,7 +32,12 @@ from beaverhabits.storage import get_user_dict_storage, session_storage
 from beaverhabits.storage.dict import DAY_MASK, DictHabitList
 from beaverhabits.storage.meta import GUI_ROOT_PATH
 from beaverhabits.storage.storage import Habit, HabitList, HabitListBuilder, HabitStatus
-from beaverhabits.utils import generate_short_hash, ratelimiter, send_email
+from beaverhabits.utils import (
+    TIME_ZONE_KEY,
+    generate_short_hash,
+    ratelimiter,
+    send_email,
+)
 
 user_storage = get_user_dict_storage()
 
@@ -253,40 +262,46 @@ class UserConfigs:
 
 
 async def get_user_configs(user: User) -> UserConfigs:
-    configs = await crud.get_user_configs(user) or {}
+    prefs = await preferences.get_user_preferences(user)
     return UserConfigs(
-        custom_css=configs.get("css", None),
-        default_chips=configs.get("default_chips", None),
-        default_chips_mapping=configs.get("default_chips_mapping", None),
+        custom_css=prefs.custom_css,
+        default_chips=prefs.completion_status_list,
+        default_chips_mapping=prefs.completion_status_mapping,
     )
+
+
+def _sync_preferences_to_session(prefs: UserPreferences) -> None:
+    """Best-effort mirror of persisted preferences into the NiceGUI session.
+
+    Keeps the fast-path readers (get_default_chips / get_default_chips_mapping /
+    apply_theme_style / the timezone helpers) consistent with the database. A
+    no-op when there is no active client session (e.g. on the REST API path).
+    """
+    try:
+        app.storage.user.update(
+            {
+                "custom_css": prefs.custom_css or "",
+                "default_chips": prefs.completion_status_list,
+                "default_chips_mapping": prefs.completion_status_mapping,
+            }
+        )
+        # Only override the browser-detected zone when the user set one explicitly.
+        if prefs.timezone:
+            app.storage.user[TIME_ZONE_KEY] = prefs.timezone
+    except Exception as e:
+        logger.error(f"Failed to sync preferences to session: {e}")
 
 
 async def cache_user_configs(user: User) -> None:
-    configs = await get_user_configs(user)
-    app.storage.user.update(
-        {
-            "custom_css": configs.custom_css or "",
-            "default_chips": configs.default_chips or [],
-            "default_chips_mapping": configs.default_chips_mapping or {},
-        }
-    )
-
-
-def sanitize_css(css: str) -> str:
-    """Strip any HTML tags from user-supplied CSS to prevent XSS via </style> injection."""
-    return re.sub(r"<[^>]*>", "", css)
+    prefs = await preferences.get_user_preferences(user)
+    _sync_preferences_to_session(prefs)
 
 
 async def update_custom_css(user: User, css: str) -> None:
-    css = sanitize_css(css)
-    app.storage.user["custom_css"] = css
-
-    await crud.update_user_configs(
-        user,
-        {
-            "css": css,
-        },
+    prefs = await preferences.update_user_preferences(
+        user, UserPreferencesUpdate(custom_css=css)
     )
+    _sync_preferences_to_session(prefs)
 
 
 def get_default_chips() -> list[str]:
@@ -300,17 +315,24 @@ def get_default_chips_mapping() -> dict[str, str]:
 async def update_default_chips(
     user: User | None, chips: list[str], mapping: dict[str, str]
 ) -> None:
-    app.storage.user["default_chips"] = chips
-    app.storage.user["default_chips_mapping"] = mapping
+    # Validates + normalizes (raises pydantic.ValidationError on bad input).
+    update = UserPreferencesUpdate(
+        completion_status_list=chips,
+        completion_status_mapping=mapping,
+    )
+    normalized = preferences.preferences_from_config_data(
+        preferences.update_to_config_data(update)
+    )
+
+    # Mirror into the session for both logged-in and demo (user=None) flows.
+    try:
+        app.storage.user["default_chips"] = normalized.completion_status_list
+        app.storage.user["default_chips_mapping"] = normalized.completion_status_mapping
+    except Exception as e:
+        logger.error(f"Failed to update default chips in session: {e}")
 
     if user:
-        await crud.update_user_configs(
-            user,
-            {
-                "default_chips": chips,
-                "default_chips_mapping": mapping,
-            },
-        )
+        await preferences.update_user_preferences(user, update)
 
 
 def apply_theme_style() -> None:

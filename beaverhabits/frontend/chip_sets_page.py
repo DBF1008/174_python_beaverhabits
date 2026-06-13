@@ -1,6 +1,7 @@
 from typing import Optional
 
 from nicegui import ui
+from pydantic import ValidationError
 
 from beaverhabits import views
 from beaverhabits.app.db import User
@@ -68,7 +69,12 @@ async def chip_sets_page(user: Optional[User] = None):
 
             async def save_chips():
                 mapping = _chips_to_mapping(mapping_input.value)
-                await views.update_default_chips(user, chips_input.value, mapping)
+                try:
+                    await views.update_default_chips(user, chips_input.value, mapping)
+                except ValidationError as e:
+                    detail = e.errors()[0]["msg"] if e.errors() else "Invalid input"
+                    ui.notify(detail.removeprefix("Value error, "), color="negative")
+                    return
                 ui.notify("Saved", color="positive")
 
             ui.button("Save", on_click=save_chips).props("flat dense")

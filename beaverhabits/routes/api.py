@@ -6,8 +6,10 @@ from loguru import logger
 from pydantic import BaseModel
 
 from beaverhabits import views
+from beaverhabits.app import preferences
 from beaverhabits.app.db import User
 from beaverhabits.app.dependencies import current_active_user
+from beaverhabits.app.preferences import UserPreferences, UserPreferencesUpdate
 from beaverhabits.core.completions import CStatus, get_habit_date_completion
 from beaverhabits.storage.storage import (
     Habit,
@@ -210,6 +212,27 @@ async def put_habit_completions(
     habit = await views.get_user_habit(user, habit_id)
     await habit.tick(day, tick.done, tick.text)
     return {"day": day.strftime(tick.date_fmt), "done": tick.done}
+
+
+@api_router.get("/user/preferences", tags=["preferences"])
+async def get_preferences(
+    user: User = Depends(current_active_user),
+) -> UserPreferences:
+    """Read the caller's effective preferences (defaults applied)."""
+    return await preferences.get_user_preferences(user)
+
+
+@api_router.put("/user/preferences", tags=["preferences"])
+async def put_preferences(
+    update: UserPreferencesUpdate,
+    user: User = Depends(current_active_user),
+) -> UserPreferences:
+    """Partially update the caller's preferences and return the effective result.
+
+    Only fields present in the body are changed; invalid values are rejected with
+    HTTP 422 by request validation.
+    """
+    return await preferences.update_user_preferences(user, update)
 
 
 def format_json_response(habit: Habit) -> dict:
